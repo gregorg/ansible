@@ -24,6 +24,7 @@ from ansible.inventory.expand_hosts import detect_range
 from ansible.inventory.expand_hosts import expand_hostname_range
 from ansible import errors
 import shlex
+import re
 
 class InventoryParser(object):
     """
@@ -68,7 +69,8 @@ class InventoryParser(object):
                 if line.find(":vars") != -1 or line.find(":children") != -1:
                     active_group_name = active_group_name.rsplit(":", 1)[0]
                     if active_group_name not in self.groups:
-                        self.groups[active_group_name] = Group(name=active_group_name)
+                        new_group = self.groups[active_group_name] = Group(name=active_group_name)
+                        all.add_child_group(new_group)
                     active_group_name = None
                 elif active_group_name not in self.groups:
                     new_group = self.groups[active_group_name] = Group(name=active_group_name)
@@ -108,6 +110,8 @@ class InventoryParser(object):
                         self.hosts[hn] = host
                     if len(tokens) > 1:
                         for t in tokens[1:]:
+                            if t.startswith('#'):
+                                break
                             (k,v) = t.split("=")
                             host.set_variable(k,v)
                     self.groups[active_group_name].add_host(host)
@@ -163,5 +167,13 @@ class InventoryParser(object):
                 if line.find("=") == -1:
                     raise errors.AnsibleError("variables assigned to group must be in key=value form")
                 else:
-                    (k,v) = line.split("=",1)
-                    group.set_variable(k,v)
+                    (k, v) = [e.strip() for e in line.split("=", 1)]
+                    # When the value is a single-quoted or double-quoted string
+                    if re.match(r"^(['\"]).*\1$", v):
+                        # Unquote the string
+                        group.set_variable(k, re.sub(r"^['\"]|['\"]$", '', v))
+                    else:
+                        group.set_variable(k, v)
+
+    def get_host_variables(self, host):
+        return {}

@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2013, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -30,7 +30,7 @@ class Play(object):
        'handlers', 'remote_user', 'remote_port',
        'sudo', 'sudo_user', 'transport', 'playbook',
        'tags', 'gather_facts', 'serial', '_ds', '_handlers', '_tasks',
-       'basedir'
+       'basedir', 'any_errors_fatal', 'roles'
     ]
 
     # to catch typos and so forth -- these are userland names
@@ -38,7 +38,8 @@ class Play(object):
     VALID_KEYS = [
        'hosts', 'name', 'vars', 'vars_prompt', 'vars_files',
        'tasks', 'handlers', 'user', 'port', 'include',
-       'sudo', 'sudo_user', 'connection', 'tags', 'gather_facts', 'serial'
+       'sudo', 'sudo_user', 'connection', 'tags', 'gather_facts', 'serial',
+       'any_errors_fatal', 'roles'
     ]
 
     # *************************************************
@@ -50,40 +51,49 @@ class Play(object):
             if not x in Play.VALID_KEYS:
                 raise errors.AnsibleError("%s is not a legal parameter in an Ansible Playbook" % x)
 
-        # TODO: more error handling
+        # allow all playbook keys to be set by --extra-vars
+        self.vars             = ds.get('vars', {})
+        self.vars_prompt      = ds.get('vars_prompt', {})
+        self.playbook         = playbook
+        self.vars             = self._get_vars()
+        self.basedir          = basedir
+        self.roles            = ds.get('roles', None)
+
+        ds = self._load_roles(self.roles, ds)
+        self.vars_files       = ds.get('vars_files', [])
+
+        self._update_vars_files_for_host(None)
+
+        self._ds = ds         = utils.template(basedir, ds, self.vars)
 
         hosts = ds.get('hosts')
         if hosts is None:
             raise errors.AnsibleError('hosts declaration is required')
         elif isinstance(hosts, list):
             hosts = ';'.join(hosts)
-        self._ds          = ds
-        self.playbook     = playbook
-        self.basedir      = basedir
-        self.vars         = ds.get('vars', {})
-        self.vars_files   = ds.get('vars_files', [])
-        self.vars_prompt  = ds.get('vars_prompt', {})
-        self.vars         = self._get_vars()
-        self.hosts        = utils.template(basedir, hosts, self.vars)
-        self.name         = ds.get('name', self.hosts)
-        self._tasks       = ds.get('tasks', [])
-        self._handlers    = ds.get('handlers', [])
-        self.remote_user  = utils.template(basedir, ds.get('user', self.playbook.remote_user), self.vars)
-        self.remote_port  = ds.get('port', self.playbook.remote_port)
-        self.sudo         = ds.get('sudo', self.playbook.sudo)
-        self.sudo_user    = utils.template(basedir, ds.get('sudo_user', self.playbook.sudo_user), self.vars)
-        self.transport    = ds.get('connection', self.playbook.transport)
-        self.tags         = ds.get('tags', None)
-        self.gather_facts = ds.get('gather_facts', None)
-        self.serial       = int(utils.template_ds(basedir, ds.get('serial', 0), self.vars))
 
-        if isinstance(self.remote_port, basestring):
-            self.remote_port = utils.template(basedir, self.remote_port, self.vars)
+        self.serial           = int(ds.get('serial', 0))
+        self.hosts            = hosts
+        self.name             = ds.get('name', self.hosts)
+        self._tasks           = ds.get('tasks', [])
+        self._handlers        = ds.get('handlers', [])
+        self.remote_user      = ds.get('user', self.playbook.remote_user)
+        self.remote_port      = ds.get('port', self.playbook.remote_port)
+        self.sudo             = ds.get('sudo', self.playbook.sudo)
+        self.sudo_user        = ds.get('sudo_user', self.playbook.sudo_user)
+        self.transport        = ds.get('connection', self.playbook.transport)
+        self.tags             = ds.get('tags', None)
+        self.gather_facts     = ds.get('gather_facts', None)
+        self.serial           = int(ds.get('serial', 0))
+        self.remote_port      = self.remote_port
+        self.any_errors_fatal = ds.get('any_errors_fatal', False)
 
-        self._update_vars_files_for_host(None)
+        load_vars = {}
+        if self.playbook.inventory.basedir() is not None:
+            load_vars['inventory_dir'] = self.playbook.inventory.basedir();
 
-        self._tasks      = self._load_tasks(self._ds, 'tasks')
-        self._handlers   = self._load_tasks(self._ds, 'handlers')
+        self._tasks      = self._load_tasks(self._ds.get('tasks', []), load_vars)
+        self._handlers   = self._load_tasks(self._ds.get('handlers', []), load_vars)
 
         if self.tags is None:
             self.tags = []
@@ -94,41 +104,135 @@ class Play(object):
 
         if self.sudo_user != 'root':
             self.sudo = True
+        
 
     # *************************************************
 
-    def _load_tasks(self, ds, keyname):
+    def _load_roles(self, roles, ds):
+
+
+        # a role is a name that auto-includes the following if they exist
+        #    <rolename>/tasks/main.yml
+        #    <rolename>/handlers/main.yml
+        #    <rolename>/vars/main.yml
+        # and it auto-extends tasks/handlers/vars_files as appropriate if found
+
+        if roles is None:
+            return ds
+        if type(roles) != list:
+            raise errors.AnsibleError("value of 'roles:' must be a list")
+
+        new_tasks = []
+        new_handlers = []
+        new_vars_files = []
+
+        # variables if the role was parameterized (i.e. given as a hash) 
+        has_dict = {}
+
+        for orig_path in roles:
+
+            if type(orig_path) == dict:
+                # what, not a path?
+                role_name = orig_path.get('role', None)
+                if role_name is None:
+                    raise errors.AnsibleError("expected a role name in dictionary: %s" % orig_path)
+                has_dict = orig_path
+                orig_path = role_name
+
+            path = utils.path_dwim(self.basedir, orig_path)
+            if not os.path.isdir(path) and not orig_path.startswith(".") and not orig_path.startswith("/"):
+                path2 = utils.path_dwim(self.basedir, os.path.join('roles', orig_path))
+                if not os.path.isdir(path2):
+                    raise errors.AnsibleError("cannot find role in %s or %s" % (path, path2))
+                path = path2
+            elif not os.path.isdir(path):
+                raise errors.AnsibleError("cannot find role in %s" % (path))
+            task      = utils.path_dwim(self.basedir, os.path.join(path, 'tasks', 'main.yml'))
+            handler   = utils.path_dwim(self.basedir, os.path.join(path, 'handlers', 'main.yml'))
+            vars_file = utils.path_dwim(self.basedir, os.path.join(path, 'vars', 'main.yml'))
+            if os.path.isfile(task):
+                new_tasks.append(dict(include=task, vars=has_dict))
+            if os.path.isfile(handler):
+                new_handlers.append(dict(include=handler, vars=has_dict))
+            if os.path.isfile(vars_file):
+                new_vars_files.append(vars_file)
+
+        tasks = ds.get('tasks', None)
+        handlers = ds.get('handlers', None)
+        vars_files = ds.get('vars_files', None)
+        if type(tasks) != list:
+            tasks = []
+        if type(handlers) != list:
+            handlers = []
+        if type(vars_files) != list:
+            vars_files = []
+        new_tasks.extend(tasks)
+        new_handlers.extend(handlers)
+        new_vars_files.extend(vars_files)
+        ds['tasks'] = new_tasks
+        ds['handlers'] = new_handlers
+        ds['vars_files'] = new_vars_files
+ 
+        return ds
+
+    # *************************************************
+
+    def _load_tasks(self, tasks, vars={}, additional_conditions=[], original_file=None):
         ''' handle task and handler include statements '''
 
-        tasks = ds.get(keyname, [])
         results = []
+        if tasks is None:
+            # support empty handler files, and the like.
+            tasks = []
+
         for x in tasks:
+            if not isinstance(x, dict):
+                raise errors.AnsibleError("expecting dict; got: %s" % x)
+            task_vars = self.vars.copy()
+            task_vars.update(vars)
+            if original_file:
+                task_vars['_original_file'] = original_file
+
             if 'include' in x:
-                task_vars = self.vars.copy()
-                tokens = shlex.split(x['include'])
+                tokens = shlex.split(str(x['include']))
                 items = ['']
+                included_additional_conditions = list(additional_conditions)
                 for k in x:
-                    if not k.startswith("with_"):
-                        continue
-                    plugin_name = k[5:]
-                    if plugin_name not in utils.plugins.lookup_loader:
-                        raise errors.AnsibleError("cannot find lookup plugin named %s for usage in with_%s" % (plugin_name, plugin_name))
-                    terms = utils.template_ds(self.basedir, x[k], task_vars)
-                    items = utils.plugins.lookup_loader.get(plugin_name, basedir=self.basedir, runner=None).run(terms, inject=task_vars)
+                    if k.startswith("with_"):
+                        plugin_name = k[5:]
+                        if plugin_name not in utils.plugins.lookup_loader:
+                            raise errors.AnsibleError("cannot find lookup plugin named %s for usage in with_%s" % (plugin_name, plugin_name))
+                        terms = utils.template(self.basedir, x[k], task_vars)
+                        items = utils.plugins.lookup_loader.get(plugin_name, basedir=self.basedir, runner=None).run(terms, inject=task_vars)
+                    elif k.startswith("when_"):
+                        included_additional_conditions.append(utils.compile_when_to_only_if("%s %s" % (k[5:], x[k])))
+                    elif k == 'when':
+                        included_additional_conditions.append(utils.compile_when_to_only_if("jinja2_compare %s" % x[k]))
+                    elif k in ("include", "vars", "only_if"):
+                        pass
+                    else:
+                        raise errors.AnsibleError("parse error: task includes cannot be used with other directives: %s" % k)
+
+                if 'vars' in x:
+                    task_vars.update(x['vars'])
+                if 'only_if' in x:
+                    included_additional_conditions.append(x['only_if'])
 
                 for item in items:
                     mv = task_vars.copy()
                     mv['item'] = item
                     for t in tokens[1:]:
                         (k,v) = t.split("=", 1)
-                        mv[k] = utils.template_ds(self.basedir, v, mv)
-                    include_file = utils.template(self.basedir, tokens[0], mv)
-                    data = utils.parse_yaml_from_file(utils.path_dwim(self.basedir, include_file))
-                    for y in data:
-                        results.append(Task(self,y,module_vars=mv.copy()))
+                        mv[k] = utils.template(self.basedir, v, mv)
+                    dirname = self.basedir
+                    if original_file:
+                         dirname = os.path.dirname(original_file)     
+                    include_file = utils.template(dirname, tokens[0], mv)
+                    include_filename = utils.path_dwim(dirname, include_file)
+                    data = utils.parse_yaml_from_file(include_filename)
+                    results += self._load_tasks(data, mv, included_additional_conditions, original_file=include_filename)
             elif type(x) == dict:
-                task_vars = self.vars.copy()
-                results.append(Task(self,x,module_vars=task_vars))
+                results.append(Task(self,x,module_vars=task_vars, additional_conditions=additional_conditions))
             else:
                 raise Exception("unexpected task type")
 
@@ -180,6 +284,7 @@ class Play(object):
 
                 vname = var['name']
                 prompt = var.get("prompt", vname)
+                default = var.get("default", None)
                 private = var.get("private", True)
 
                 confirm = var.get("confirm", False)
@@ -188,20 +293,25 @@ class Play(object):
                 salt = var.get("salt", None)
 
                 if vname not in self.playbook.extra_vars:
-                    vars[vname] = self.playbook.callbacks.on_vars_prompt(vname, private, prompt,encrypt, confirm, salt_size, salt)
+                    vars[vname] = self.playbook.callbacks.on_vars_prompt(
+                                     vname, private, prompt, encrypt, confirm, salt_size, salt, default
+                                  )
 
         elif type(self.vars_prompt) == dict:
             for (vname, prompt) in self.vars_prompt.iteritems():
                 prompt_msg = "%s: " % prompt
                 if vname not in self.playbook.extra_vars:
-                    vars[vname] = self.playbook.callbacks.on_vars_prompt(varname=vname, private=False, prompt=prompt_msg)
+                    vars[vname] = self.playbook.callbacks.on_vars_prompt(
+                                     varname=vname, private=False, prompt=prompt_msg, default=None
+                                  )
 
         else:
             raise errors.AnsibleError("'vars_prompt' section is malformed, see docs")
 
-        results = self.playbook.extra_vars.copy()
-        results.update(vars)
-        return results
+        if type(self.playbook.extra_vars) == dict:
+            vars.update(self.playbook.extra_vars)
+
+        return vars
 
     # *************************************************
 
@@ -246,6 +356,11 @@ class Play(object):
         if type(self.vars_files) != list:
             self.vars_files = [ self.vars_files ]
 
+        if host is not None:
+            inject = {}
+            inject.update(self.playbook.inventory.get_variables(host))
+            inject.update(self.playbook.SETUP_CACHE[host])
+
         for filename in self.vars_files:
 
             if type(filename) == list:
@@ -257,7 +372,7 @@ class Play(object):
                     filename2 = utils.template(self.basedir, real_filename, self.vars)
                     filename3 = filename2
                     if host is not None:
-                        filename3 = utils.template(self.basedir, filename2, self.playbook.SETUP_CACHE[host])
+                        filename3 = utils.template(self.basedir, filename2, inject)
                     filename4 = utils.path_dwim(self.basedir, filename3)
                     sequence.append(filename4)
                     if os.path.exists(filename4):
@@ -290,18 +405,19 @@ class Play(object):
                 filename2 = utils.template(self.basedir, filename, self.vars)
                 filename3 = filename2
                 if host is not None:
-                    filename3 = utils.template(self.basedir, filename2, self.playbook.SETUP_CACHE[host])
+                    filename3 = utils.template(self.basedir, filename2, inject)
                 filename4 = utils.path_dwim(self.basedir, filename3)
                 if self._has_vars_in(filename4):
                     continue
                 new_vars = utils.parse_yaml_from_file(filename4)
                 if new_vars:
                     if type(new_vars) != dict:
-                        raise errors.AnsibleError("%s must be stored as dictonary/hash: %s" % filename4)
+                        raise errors.AnsibleError("%s must be stored as dictonary/hash: %s" % (filename4, type(new_vars)))
                     if host is not None and self._has_vars_in(filename2) and not self._has_vars_in(filename3):
                         # running a host specific pass and has host specific variables
                         # load into setup cache
                         self.playbook.SETUP_CACHE[host].update(new_vars)
+                        self.playbook.callbacks.on_import_for_host(host, filename4)
                     elif host is None:
                         # running a non-host specific pass and we can update the global vars instead
                         self.vars.update(new_vars)
