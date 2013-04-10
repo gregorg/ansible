@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2013, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -27,7 +27,8 @@ class Task(object):
         'play', 'notified_by', 'tags', 'register',
         'delegate_to', 'first_available_file', 'ignore_errors',
         'local_action', 'transport', 'sudo', 'sudo_user', 'sudo_pass',
-        'items_lookup_plugin', 'items_lookup_terms'
+        'items_lookup_plugin', 'items_lookup_terms', 'environment', 'args',
+        'any_errors_fatal'
     ]
 
     # to prevent typos and such
@@ -35,7 +36,8 @@ class Task(object):
          'name', 'action', 'only_if', 'async', 'poll', 'notify',
          'first_available_file', 'include', 'tags', 'register', 'ignore_errors',
          'delegate_to', 'local_action', 'transport', 'sudo', 'sudo_user',
-         'sudo_pass', 'when'
+         'sudo_pass', 'when', 'connection', 'environment', 'args',
+         'any_errors_fatal'
     ]
 
     def __init__(self, play, ds, module_vars=None, additional_conditions=None):
@@ -47,6 +49,15 @@ class Task(object):
             if x in utils.plugins.module_finder:
                 if 'action' in ds:
                     raise errors.AnsibleError("multiple actions specified in task %s" % (ds.get('name', ds['action'])))
+                if isinstance(ds[x], dict):
+                    if 'args' in ds:
+                        raise errors.AnsibleError("can't combine args: and a dict for %s: in task %s" % (x, ds.get('name', "%s: %s" % (x, ds[x]))))
+                    ds['args'] = ds[x]
+                    ds[x] = ''
+                elif ds[x] is None:
+                    ds[x] = ''
+                if not isinstance(ds[x], basestring):
+                    raise errors.AnsibleError("action specified for task %s has invalid type %s" % (ds.get('name', "%s: %s" % (x, ds[x])), type(ds[x])))
                 ds['action'] = x + " " + ds[x]
                 ds.pop(x)
 
@@ -60,7 +71,11 @@ class Task(object):
                 else:
                     raise errors.AnsibleError("cannot find lookup plugin named %s for usage in with_%s" % (plugin_name, plugin_name))
 
+            elif x == 'when':
+                ds['when'] = "jinja2_compare %s" % (ds[x])
             elif x.startswith("when_"):
+                if 'when' in ds:
+                    raise errors.AnsibleError("multiple when_* statements specified in task %s" % (ds.get('name', ds['action'])))
                 when_name = x.replace("when_","")
                 ds['when'] = "%s %s" % (when_name, ds[x])
                 ds.pop(x)
@@ -76,9 +91,14 @@ class Task(object):
         self.tags         = [ 'all' ]
         self.register     = ds.get('register', None)
         self.sudo         = utils.boolean(ds.get('sudo', play.sudo))
+        self.environment  = ds.get('environment', {})
+
+        # rather than simple key=value args on the options line, these represent structured data and the values
+        # can be hashes and lists, not just scalars
+        self.args         = ds.get('args', {})
 
         if self.sudo:
-            self.sudo_user    = ds.get('sudo_user', play.sudo_user)
+            self.sudo_user    = utils.template(play.basedir, ds.get('sudo_user', play.sudo_user), play.vars)
             self.sudo_pass    = ds.get('sudo_pass', play.playbook.sudo_pass)
         else:
             self.sudo_user    = None
@@ -99,9 +119,16 @@ class Task(object):
             self.delegate_to = ds.get('delegate_to', None)
             self.transport   = ds.get('connection', ds.get('transport', play.transport))
 
+        if isinstance(self.action, dict):
+            if 'module' not in self.action:
+                raise errors.AnsibleError("'module' attribute missing from action in task \"%s\"" % ds.get('name', '%s' % self.action))
+            if self.args:
+                raise errors.AnsibleError("'args' cannot be combined with dict 'action' in task \"%s\"" % ds.get('name', '%s' % self.action))
+            self.args = self.action
+            self.action = self.args.pop('module')
+
         # delegate_to can use variables
         if not (self.delegate_to is None):
-            self.delegate_to = utils.template(None, self.delegate_to, self.module_vars)
             # delegate_to: localhost should use local transport
             if self.delegate_to in ['127.0.0.1', 'localhost']:
                 self.transport   = 'local'
@@ -128,6 +155,7 @@ class Task(object):
      
 
         self.ignore_errors = ds.get('ignore_errors', False)
+        self.any_errors_fatal = ds.get('any_errors_fatal', play.any_errors_fatal)
 
         # action should be a string
         if not isinstance(self.action, basestring):
