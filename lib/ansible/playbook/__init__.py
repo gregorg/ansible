@@ -16,8 +16,9 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 import ansible.inventory
-import ansible.runner
 import ansible.constants as C
+import ansible.runner
+from ansible.utils.template import template
 from ansible import utils
 from ansible import errors
 import ansible.callbacks
@@ -128,11 +129,13 @@ class PlayBook(object):
             self.inventory    = inventory
 
         self.basedir     = os.path.dirname(playbook) or '.'
+        utils.plugins.push_basedir(self.basedir)
         vars = {}
         if self.inventory.basedir() is not None:
             vars['inventory_dir'] = self.inventory.basedir()
         self.filename = playbook
         (self.playbook, self.play_basedirs) = self._load_playbook_from_file(playbook, vars)
+        ansible.callbacks.load_callback_plugins()
 
     # *****************************************************
 
@@ -152,7 +155,7 @@ class PlayBook(object):
         utils.plugins.push_basedir(basedir)
         for play in playbook_data:
             if type(play) != dict:
-                raise errors.AnsibleError("parse error: each play in a playbook must a YAML dictionary (hash), recieved: %s" % play)
+                raise errors.AnsibleError("parse error: each play in a playbook must be a YAML dictionary (hash), recieved: %s" % play)
 
             if 'include' in play:
                 # a playbook (list of plays) decided to include some other list of plays
@@ -174,21 +177,24 @@ class PlayBook(object):
                 for t in tokens[1:]:
 
                     (k,v) = t.split("=", 1)
-                    incvars[k] = utils.template(basedir, v, incvars)
-                    included_path = utils.path_dwim(basedir, utils.template(basedir, tokens[0], incvars))
-                    (plays, basedirs) = self._load_playbook_from_file(included_path, incvars)
-                    for p in plays:
-                        # support for parameterized play includes works by passing
-                        # those variables along to the subservient play
-                        if 'vars' not in p:
-                            p['vars'] = {}
-                        if isinstance(p['vars'], dict):
-                            p['vars'].update(incvars)
-                        elif isinstance(p['vars'], list):
-                            # nobody should really do this, but handle vars: a=1 b=2
-                            p['vars'].extend([dict(k=v) for k,v in incvars.iteritems()])
-                    accumulated_plays.extend(plays)
-                    play_basedirs.extend(basedirs)
+                    incvars[k] = template(basedir, v, incvars)
+
+                included_path = utils.path_dwim(basedir, template(basedir, tokens[0], incvars))
+                (plays, basedirs) = self._load_playbook_from_file(included_path, incvars)
+                for p in plays:
+                    # support for parameterized play includes works by passing
+                    # those variables along to the subservient play
+                    if 'vars' not in p:
+                        p['vars'] = {}
+                    if isinstance(p['vars'], dict):
+                        p['vars'].update(incvars)
+                    elif isinstance(p['vars'], list):
+                        # nobody should really do this, but handle vars: a=1 b=2
+                        p['vars'].extend([dict(k=v) for k,v in incvars.iteritems()])
+
+                accumulated_plays.extend(plays)
+                play_basedirs.extend(basedirs)
+
             else:
 
                 # this is a normal (non-included play)
@@ -209,9 +215,7 @@ class PlayBook(object):
         self.callbacks.on_start()
         for (play_ds, play_basedir) in zip(self.playbook, self.play_basedirs):
             play = Play(self, play_ds, play_basedir)
-
-            self.callbacks.play = play
-            self.runner_callbacks.play = play
+            assert play is not None
             
             matched_tags, unmatched_tags = play.compare_tags(self.only_tags)
             matched_tags_all = matched_tags_all | matched_tags
@@ -219,7 +223,9 @@ class PlayBook(object):
 
             # if we have matched_tags, the play must be run.
             # if the play contains no tasks, assume we just want to gather facts
-            if (len(matched_tags) > 0 or len(play.tasks()) == 0):
+            # in this case there are actually 3 meta tasks (handler flushes) not 0
+            # tasks, so that's why there's a check against 3
+            if (len(matched_tags) > 0 or len(play.tasks()) == 3):
                 plays.append(play)
 
         # if the playbook is invoked with --tags that don't exist at all in the playbooks
@@ -235,8 +241,12 @@ class PlayBook(object):
             raise errors.AnsibleError(msg % (unknown, unmatched))
 
         for play in plays:
+            ansible.callbacks.set_play(self.callbacks, play)
+            ansible.callbacks.set_play(self.runner_callbacks, play)
             if not self._run_play(play):
                 break
+            ansible.callbacks.set_play(self.callbacks, None)
+            ansible.callbacks.set_play(self.runner_callbacks, None)
 
         # summarize the results
         results = {}
@@ -313,11 +323,13 @@ class PlayBook(object):
     def _run_task(self, play, task, is_handler):
         ''' run a single task in the playbook and recursively run any subtasks.  '''
 
-        self.callbacks.task = task
-        self.runner_callbacks.task = task
+        ansible.callbacks.set_task(self.callbacks, task)
+        ansible.callbacks.set_task(self.runner_callbacks, task)
 
-        self.callbacks.on_task_start(utils.template(play.basedir, task.name, task.module_vars, lookup_fatal=False), is_handler)
+        self.callbacks.on_task_start(template(play.basedir, task.name, task.module_vars, lookup_fatal=False), is_handler)
         if hasattr(self.callbacks, 'skip_task') and self.callbacks.skip_task:
+            ansible.callbacks.set_task(self.callbacks, None)
+            ansible.callbacks.set_task(self.runner_callbacks, None)
             return True
         
         # load up an appropriate ansible runner to run the task in parallel
@@ -334,9 +346,6 @@ class PlayBook(object):
 
         # add facts to the global setup cache
         for host, result in contacted.iteritems():
-            # Skip register variable if host is skipped
-            if result.get('skipped', False):
-                continue
             facts = result.get('ansible_facts', {})
             self.SETUP_CACHE[host].update(facts)
             # extra vars need to always trump - so update  again following the facts
@@ -346,13 +355,23 @@ class PlayBook(object):
                     result['stdout_lines'] = result['stdout'].splitlines()
                 self.SETUP_CACHE[host][task.register] = result
 
+        # also have to register some failed, but ignored, tasks
+        if task.ignore_errors and task.register:
+            failed = results.get('failed', {})
+            for host, result in failed.iteritems():
+                if 'stdout' in result:
+                    result['stdout_lines'] = result['stdout'].splitlines()
+                self.SETUP_CACHE[host][task.register] = result
+
         # flag which notify handlers need to be run
         if len(task.notify) > 0:
             for host, results in results.get('contacted',{}).iteritems():
                 if results.get('changed', False):
                     for handler_name in task.notify:
-                        self._flag_handler(play, utils.template(play.basedir, handler_name, task.module_vars), host)
+                        self._flag_handler(play, template(play.basedir, handler_name, task.module_vars), host)
 
+        ansible.callbacks.set_task(self.callbacks, None)
+        ansible.callbacks.set_task(self.runner_callbacks, None)
         return hosts_remaining
 
     # *****************************************************
@@ -366,7 +385,7 @@ class PlayBook(object):
 
         found = False
         for x in play.handlers():
-            if handler_name == utils.template(play.basedir, x.name, x.module_vars):
+            if handler_name == template(play.basedir, x.name, x.module_vars):
                 found = True
                 self.callbacks.on_notify(host, x.name)
                 x.notified_by.append(host)
@@ -390,8 +409,8 @@ class PlayBook(object):
         self.callbacks.on_setup()
         self.inventory.restrict_to(host_list)
         
-        self.callbacks.task = None
-        self.runner_callbacks.task = None
+        ansible.callbacks.set_task(self.callbacks, None)
+        ansible.callbacks.set_task(self.runner_callbacks, None)
 
         # push any variables down to the system
         setup_results = ansible.runner.Runner(
@@ -483,15 +502,38 @@ class PlayBook(object):
             self.inventory.also_restrict_to(on_hosts)
 
             for task in play.tasks():
+
+                if task.meta is not None:
+
+                    # meta tasks are an internalism and are not valid for end-user playbook usage
+                    # here a meta task is a placeholder that signals handlers should be run
+ 
+                    if task.meta == 'flush_handlers':
+                        for handler in play.handlers():
+                            if len(handler.notified_by) > 0:
+                                self.inventory.restrict_to(handler.notified_by)
+                                self._run_task(play, handler, True)
+                                self.inventory.lift_restriction()
+                                new_list = handler.notified_by[:]
+                                for host in handler.notified_by:
+                                    if host in on_hosts:
+                                        while host in new_list:
+                                            new_list.remove(host)
+                                handler.notified_by = new_list
+
+                        continue
+
                 hosts_count = len(self._list_available_hosts(play.hosts))
 
                 # only run the task if the requested tags match
                 should_run = False
                 for x in self.only_tags:
+
                     for y in task.tags:
                         if (x==y):
                             should_run = True
                             break
+
                 if should_run:
                     if not self._run_task(play, task, False):
                         # whether no hosts matched is fatal or not depends if it was on the initial step.
@@ -502,7 +544,7 @@ class PlayBook(object):
                 host_list = self._list_available_hosts(play.hosts)
 
                 if task.any_errors_fatal and len(host_list) < hosts_count:
-                  host_list = None
+                    host_list = None
 
                 # if no hosts remain, drop out
                 if not host_list:
@@ -510,12 +552,13 @@ class PlayBook(object):
                     return False
 
             # run notify actions
-            for handler in play.handlers():
-                if len(handler.notified_by) > 0:
-                    self.inventory.restrict_to(handler.notified_by)
-                    self._run_task(play, handler, True)
-                    self.inventory.lift_restriction()
-                    handler.notified_by = []
+            #for handler in play.handlers():
+            #    if len(handler.notified_by) > 0:
+            #        self.inventory.restrict_to(handler.notified_by)
+            #        self._run_task(play, handler, True)
+            #        self.inventory.lift_restriction()
+            #        handler.notified_by = []
+            #    handler.notified_by = []
 
             self.inventory.lift_also_restriction()
 
