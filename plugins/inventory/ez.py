@@ -14,7 +14,7 @@ except:
 
 import os
 import logging
-sys.path.insert (1, os.path.abspath("%s/svn_sysadmin/ezscripts/lib/python"%os.environ["HOME"]))
+sys.path.insert (1, os.path.abspath("%s/sysadmin/ezscripts/lib/python"%os.environ["HOME"]))
 sys.path.insert (2, '/usr/local/ez/lib/python')
 from ez_admin import *
 
