@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# (c) 2012, Gregory Duchatelet <greg@2lm.fr>
+# (c) 2012, Gregory Duchatelet <greg@prelinker.com>
 ######################################################################
 
 
