@@ -19,6 +19,7 @@ import os
 import shlex
 
 import ansible.constants as C
+from ansible.utils import template
 from ansible import utils
 from ansible import errors
 from ansible.runner.return_data import ReturnData
@@ -31,16 +32,23 @@ class ActionModule(object):
     def run(self, conn, tmp, module_name, module_args, inject, complex_args=None, **kwargs):
         ''' handler for file transfer operations '''
 
-        if self.runner.check:
+        if self.runner.noop_on_check(inject):
             # in check mode, always skip this module
             return ReturnData(conn=conn, comm_ok=True, result=dict(skipped=True, msg='check mode not supported for this module'))
 
-        tokens  = shlex.split(module_args)
+        # Decode the result of shlex.split() to UTF8 to get around a bug in that's been fixed in Python 2.7 but not Python 2.6.
+        # See: http://bugs.python.org/issue6988
+        tokens  = shlex.split(module_args.encode('utf8'))
+        tokens = [s.decode('utf8') for s in tokens]
+
         source  = tokens[0]
         # FIXME: error handling
         args    = " ".join(tokens[1:])
-        source  = utils.template(self.runner.basedir, source, inject)
-        source  = utils.path_dwim(self.runner.basedir, source)
+        source  = template.template(self.runner.basedir, source, inject)
+        if '_original_file' in inject:
+            source = utils.path_dwim_relative(inject['_original_file'], 'files', source, self.runner.basedir)
+        else:
+            source = utils.path_dwim(self.runner.basedir, source)
 
         # transfer the file to a remote tmp location
         source  = source.replace('\x00','') # why does this happen here?
@@ -50,20 +58,26 @@ class ActionModule(object):
 
         conn.put_file(source, tmp_src)
 
-        # fix file permissions when the copy is done as a different user
+        sudoable=True
+        # set file permissions, more permisive when the copy is done as a different user
         if self.runner.sudo and self.runner.sudo_user != 'root':
-            prepcmd = 'chmod a+rx %s' % tmp_src
+            cmd_args_chmod = "chmod a+rx %s" % tmp_src
+            sudoable=False
         else:
-            prepcmd = 'chmod +x %s' % tmp_src
+            cmd_args_chmod = "chmod +rx %s" % tmp_src
+        self.runner._low_level_exec_command(conn, cmd_args_chmod, tmp, sudoable=sudoable)
 
         # add preparation steps to one ssh roundtrip executing the script
-        module_args = prepcmd + '; ' + tmp_src + ' ' + args
+        env_string = self.runner._compute_environment_string(inject)
+        module_args = env_string + tmp_src + ' ' + args
 
         handler = utils.plugins.action_loader.get('raw', self.runner)
         result = handler.run(conn, tmp, 'raw', module_args, inject)
 
         # clean up after
-        if tmp.find("tmp") != -1 and C.DEFAULT_KEEP_REMOTE_FILES != '1':
+        if tmp.find("tmp") != -1 and not C.DEFAULT_KEEP_REMOTE_FILES:
             self.runner._low_level_exec_command(conn, 'rm -rf %s >/dev/null 2>&1' % tmp, tmp)
+
+        result.result['changed'] = True
 
         return result

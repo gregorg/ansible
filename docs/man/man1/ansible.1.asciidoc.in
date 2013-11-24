@@ -60,8 +60,9 @@ Execute the module called 'NAME'.
 
 *-M* 'DIRECTORY', *--module-path=*'DIRECTORY'::
 
-The 'DIRECTORY' to load modules from. The default is '/usr/share/ansible'.
-
+The 'DIRECTORY' search path to load modules from. The default is
+'/usr/share/ansible'. This can also be set with the ANSIBLE_LIBRARY
+environment variable.
 
 *-a* \'_ARGUMENTS_', *--args=*\'_ARGUMENTS_'::
 
@@ -100,7 +101,7 @@ Run commands in the background, killing the task after 'NUM' seconds.
 
 Poll a background job every 'NUM' seconds. Requires *-B*.
 
-*-u* 'USERNAME', *--remote-user=*'USERNAME'::
+*-u* 'USERNAME', *--user=*'USERNAME'::
 
 Use this remote 'USERNAME' instead of the current user.
 

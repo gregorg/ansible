@@ -1,21 +1,18 @@
-Playbooks
-=========
-
-.. image:: http://ansible.cc/docs/_static/ansible_fest_2013.png
-   :alt: ansiblefest 2013
-   :target: http://ansibleworks.com/fest
-
+Intro to Playbooks
+==================
 
 .. contents::
    :depth: 2
-   :backlinks: top
 
-Introduction
-````````````
+.. _about_playbooks:
 
-Playbooks are a completely different way to use ansible than in task execution mode, and are
-particularly powerful. Simply put, playbooks are the basis for a really simple
-configuration management and multi-machine deployment system,
+About Playbooks
+```````````````
+
+Playbooks are a completely different way to use ansible than in adhoc task execution mode, and are
+particularly powerful. 
+
+Simply put, playbooks are the basis for a really simple configuration management and multi-machine deployment system,
 unlike any that already exist, and one that is very well suited to deploying complex applications.
 
 Playbooks can declare configurations, but they can also orchestrate steps of
@@ -28,27 +25,35 @@ tasks, playbooks are more likely to be kept in source control and used
 to push out your configuration or assure the configurations of your
 remote systems are in spec.
 
-Let's dive in and see how they work.  As you go, you may wish to open
-the `github examples directory <https://github.com/ansible/ansible/tree/devel/examples/playbooks>`_ in
-another tab, so you can apply the theory to what things look like in practice.
-
 There are also some full sets of playbooks illustrating a lot of these techniques in the
-`ansible-examples repository <https://github.com/ansible/ansible-examples>`_.
+`ansible-examples repository <https://github.com/ansible/ansible-examples>`_.  We'd recommend
+looking at these in another tab as you go along.
+
+There are also many jumping off points after you learn playbooks, so hop back to the documentation
+index after you're done with this section.
+
+.. _playbook_language_example:
 
 Playbook Language Example
 `````````````````````````
 
-Playbooks are expressed in YAML format and have a minimum of syntax.
+Playbooks are expressed in YAML format (see :doc:`YAMLSyntax`) and have a minimum of syntax, which intentionally
+tries to not be a programming language or script, but rather a model of a configuration or a process.
+
 Each playbook is composed of one or more 'plays' in a list.
 
-The goal of a play is map a group of hosts to some well defined roles, represented by
-things ansible called tasks.  At the basic level, a task is nothing more than a call
+The goal of a play is to map a group of hosts to some well defined roles, represented by
+things ansible calls tasks.  At a basic level, a task is nothing more than a call
 to an ansible module, which you should have learned about in earlier chapters.
 
 By composing a playbook of multiple 'plays', it is possible to
 orchestrate multi-machine deployments, running certain steps on all
 machines in the webservers group, then certain steps on the database
 server group, then more commands back on the webservers group, etc.
+
+"plays" are more or less a sports analogy.  You can have quite a lot of plays that affect your systems
+to do different things.  It's not as if you were just defining one particular state or model, and you
+can run different plays at different times.  
 
 For starters, here's a playbook that contains just one play::
 
@@ -57,24 +62,28 @@ For starters, here's a playbook that contains just one play::
       vars:
         http_port: 80
         max_clients: 200
-      user: root
+      remote_user: root
       tasks:
       - name: ensure apache is at the latest version
-        action: yum pkg=httpd state=latest
+        yum: pkg=httpd state=latest
       - name: write the apache config file
-        action: template src=/srv/httpd.j2 dest=/etc/httpd.conf
+        template: src=/srv/httpd.j2 dest=/etc/httpd.conf
         notify:
         - restart apache
       - name: ensure apache is running
-        action: service name=httpd state=started
+        service: name=httpd state=started
       handlers:
         - name: restart apache
-          action: service name=httpd state=restarted
+          service: name=httpd state=restarted
 
 Below, we'll break down what the various features of the playbook language are.
 
+.. _playbook_basics:
+
 Basics
 ``````
+
+.. _playbook_hosts_and_users:
 
 Hosts and Users
 +++++++++++++++
@@ -83,26 +92,54 @@ For each play in a playbook, you get to choose which machines in your infrastruc
 to target and what remote user to complete the steps (called tasks) as.
 
 The `hosts` line is a list of one or more groups or host patterns,
-separated by colons, as described in the :ref:`patterns`
-documentation.  The `user` is just the name of the user account::
+separated by colons, as described in the :doc:`intro_patterns`
+documentation.  The `remote_user` is just the name of the user account::
 
     ---
     - hosts: webservers
-      user: root
+      remote_user: root
+
+.. Note::
+
+    The `remote_user` parameter was formerly called just `user`. It was renamed in Ansible 1.4 to make it more distinguishable from the `user` module (used to create users on remote systems).
+
+Remote users can also be defined per task::
+
+    ---
+    - hosts: webservers
+      remote_user: root
+      tasks:
+        - name: test connection
+          ping:
+          remote_user: yourname
+
+.. Note::
+
+    The `remote_user` parameter for tasks was added in 1.4.
 
 
 Support for running things from sudo is also available::
 
     ---
     - hosts: webservers
-      user: yourname
+      remote_user: yourname
       sudo: yes
+
+You can also use sudo on a particular task instead of the whole play::
+
+    ---
+    - hosts: webservers
+      remote_user: yourname
+      tasks:
+        - service: name=nginx state=started
+          sudo: yes
+
 
 You can also login as you, and then sudo to different users than root::
 
     ---
     - hosts: webservers
-      user: yourname
+      remote_user: yourname
       sudo: yes
       sudo_user: postgres
 
@@ -118,55 +155,12 @@ Just `Control-C` to kill it and run it again with `-K`.
    only occurs when sudoing from a user like 'bob' to 'timmy', not
    when going from 'bob' to 'root', or logging in directly as 'bob' or
    'root'.  If this concerns you that this data is briefly readable
-   (not writeable), avoid transferring uncrypted passwords with
+   (not writable), avoid transferring uncrypted passwords with
    `sudo_user` set.  In other cases, '/tmp' is not used and this does
    not come into play. Ansible also takes care to not log password
    parameters.
 
-Vars section
-++++++++++++
-
-The `vars` section contains a list of variables and values that can be used in the plays, like this::
-
-    ---
-    - hosts: webservers
-      user: root
-      vars:
-         http_port: 80
-         van_halen_port: 5150
-         other: 'magic'
-
-These variables can be used later in the playbook like this::
-
-    $varname or ${varname}
-
-The later is useful in the event you need to do something like ${other}_some_string.
-
-Inside templates, the full power of the `Jinja2 <http://jinja.pocoo.org/docs/>`_ templating language is also available, which looks like this::
-
-    {{ varname }}
-
-The Jinja2 documentation provides information about how to construct loops and conditionals for those
-who which to use more advanced templating.  This is optional and the $varname format still works in template
-files.
-
-If there are discovered variables about the system, called 'facts', these variables bubble up back into the
-playbook, and can be used on each system just like explicitly set variables.  Ansible provides several
-of these, prefixed with 'ansible', and are documented under 'setup' in the module documentation.  Additionally,
-facts can be gathered by ohai and facter if they are installed.  Facter variables are prefixed with ``facter_`` and Ohai
-variables are prefixed with ``ohai_``.
-
-So for instance, if I wanted
-to write the hostname into the /etc/motd file, I could say::
-
-   - name: write the motd
-     action: template src=/srv/templates/motd.j2 dest=/etc/motd
-
-And in /srv/templates/motd.j2::
-
-   You are logged into {{ facter_hostname }}
-
-But we're getting ahead of ourselves.  Let's talk about tasks.
+.. _tasks_list:
 
 Tasks list
 ++++++++++
@@ -184,7 +178,7 @@ The goal of each task is to execute a module, with very specific arguments.
 Variables, as mentioned above, can be used in arguments to modules.
 
 Modules are 'idempotent', meaning if you run them
-again, they will make the changes they are told to make to bring the
+again, they will make only the changes they must in order to bring the
 system to the desired state.  This makes it very safe to rerun
 the same playbook multiple times.  They won't change things
 unless they have to change things.
@@ -200,12 +194,17 @@ nice to have reasonably good descriptions of each task step.  If the name
 is not provided though, the string fed to 'action' will be used for
 output.
 
+Tasks can be declared using the legacy "action: module options" format, but 
+it is recommended that you use the more conventional "module: options" format.
+This recommended format is used throughout the documentation, but you may
+encounter the older format in some playbooks.
+
 Here is what a basic task looks like, as with most modules,
 the service module takes key=value arguments::
 
    tasks:
      - name: make sure apache is running
-       action: service name=httpd state=running
+       service: name=httpd state=running
 
 The `command` and `shell` modules are the one modules that just takes a list
 of arguments, and don't use the key=value form.  This makes
@@ -213,20 +212,20 @@ them work just like you would expect. Simple::
 
    tasks:
      - name: disable selinux
-       action: command /sbin/setenforce 0
+       command: /sbin/setenforce 0
 
 The command and shell module care about return codes, so if you have a command
-who's successful exit code is not zero, you may wish to do this::
+whose successful exit code is not zero, you may wish to do this::
 
    tasks:
      - name: run this command and ignore the result
-       action: shell /usr/bin/somecommand || /bin/true
+       shell: /usr/bin/somecommand || /bin/true
 
 Or this::
 
    tasks:
      - name: run this command and ignore the result
-       action: shell /usr/bin/somecommand
+       shell: /usr/bin/somecommand
        ignore_errors: True
 
 
@@ -235,54 +234,59 @@ a space and indent any continuation lines::
 
     tasks:
       - name: Copy ansible inventory file to client
-        action: copy src=/etc/ansible/hosts dest=/etc/ansible/hosts
+        copy: src=/etc/ansible/hosts dest=/etc/ansible/hosts
                 owner=root group=root mode=0644
 
 Variables can be used in action lines.   Suppose you defined
 a variable called 'vhost' in the 'vars' section, you could do this::
 
    tasks:
-     - name: create a virtual host file for $vhost
-       action: template src=somefile.j2 dest=/etc/httpd/conf.d/$vhost
+     - name: create a virtual host file for {{ vhost }}
+       template: src=somefile.j2 dest=/etc/httpd/conf.d/{{ vhost }}
 
 Those same variables are usable in templates, which we'll get to later.
 
 Now in a very basic playbook all the tasks will be listed directly in that play, though it will usually
 make more sense to break up tasks using the 'include:' directive.  We'll show that a bit later.
 
+.. _action_shorthand:
+
 Action Shorthand
 ````````````````
 
-.. versionadded: 0.8
+.. versionadded:: 0.8
 
-Rather than listing out the explicit word, "action:", like so::
-
-    action: template src=templates/foo.j2 dest=/etc/foo.conf
-
-It is also possible to say:
+Ansible prefers listing modules like this in 0.8 and later::
 
     template: src=templates/foo.j2 dest=/etc/foo.conf
 
-The name of the module is simply followed by a colon and the arguments to that module.  We think this is a lot more intuitive.  
-Our documentation has not converted over to this new format just yet as many users may still be using older versions.  
-You'll be able to use both formats forever.
+You will notice in earlier versions, this was only available as::
 
-Running Operations On Change
-````````````````````````````
+    action: template src=templates/foo.j2 dest=/etc/foo.conf
+
+The old form continues to work in newer versions without any plan of deprecation.
+
+.. _handlers:
+
+Handlers: Running Operations On Change
+``````````````````````````````````````
 
 As we've mentioned, modules are written to be 'idempotent' and can relay  when
 they have made a change on the remote system.   Playbooks recognize this and
 have a basic event system that can be used to respond to change.
 
-These 'notify' actions are triggered at the end of each 'play' in a playbook, and
-trigger only once each.  For instance, multiple resources may indicate
-that apache needs to be restarted, but apache will only be bounced once.
+These 'notify' actions are triggered at the end of each block of tasks in a playbook, and will only be
+triggered once even if notified by multiple different tasks.
+
+For instance, multiple resources may indicate
+that apache needs to be restarted because they have changed a config file,
+but apache will only be bounced once to avoid unnecessary restarts.
 
 Here's an example of restarting two services when the contents of a file
 change, but only if the file changes::
 
    - name: template configuration file
-     action: template src=template.j2 dest=/etc/foo.conf
+     template: src=template.j2 dest=/etc/foo.conf
      notify:
         - restart memcached
         - restart apache
@@ -300,9 +304,9 @@ Here's an example handlers section::
 
     handlers:
         - name: restart memcached
-          action: service name=memcached state=restarted
+          service:  name=memcached state=restarted
         - name: restart apache
-          action: service name=apache state=restarted
+          service: name=apache state=restarted
 
 Handlers are best used to restart services and trigger reboots.  You probably
 won't need them for much else.
@@ -310,112 +314,21 @@ won't need them for much else.
 .. note::
    Notify handlers are always run in the order written.
 
-
-Task Include Files And Encouraging Reuse
-````````````````````````````````````````
-
-Suppose you want to reuse lists of tasks between plays or playbooks.  You can use
-include files to do this.  Use of included task lists is a great way to define a role
-that system is going to fulfill.  Remember, the goal of a play in a playbook is to map
-a group of systems into multiple roles.  Let's see what this looks like...
-
-A task include file simply contains a flat list of tasks, like so::
-
-    ---
-    # possibly saved as tasks/foo.yml
-    - name: placeholder foo
-      action: command /bin/foo
-    - name: placeholder bar
-      action: command /bin/bar
-
-Include directives look like this, and can be mixed in with regular tasks in a playbook::
-
-   tasks:
-    - include: tasks/foo.yml
-
-You can also pass variables into includes.  We call this a 'parameterized include'.
-
-For instance, if deploying multiple wordpress instances, I could
-contain all of my wordpress tasks in a single wordpress.yml file, and use it like so::
-
-   tasks:
-     - include: wordpress.yml user=timmy
-     - include: wordpress.yml user=alice
-     - include: wordpress.yml user=bob
-
-Variables passed in can then be used in the included files.  You can reference them like this::
-
-   $user
-
-(In addition to the explicitly passed in parameters, all variables from
-the vars section are also available for use here as well.)
-
-Starting in 1.0, variables can also be passed to include files using an alternative syntax,
-which also supports structured variables::
+Roles are described later on.  It's worthwhile to point out that handlers are
+automatically processed between 'pre_tasks', 'roles', 'tasks', and 'post_tasks'
+sections.  If you ever want to flush all the handler commands immediately though,
+in 1.2 and later, you can::
 
     tasks:
+       - shell: some tasks go here
+       - meta: flush_handlers
+       - shell: some other tasks
 
-      - include: wordpress.yml
-        vars:
-            user: timmy
-            some_list_variable: 
-              - alpha
-              - beta
-              - gamma
+In the above example any queued up handlers would be processed early when the 'meta'
+statement was reached.  This is a bit of a niche case but can come in handy from
+time to time.
 
-Playbooks can include other playbooks too, but that's mentioned in a later section.
-
-.. note::
-   As of 1.0, task include statements can be used at arbitrary depth.
-   They were previously limited to a single level, so task includes
-   could not include other files containing task includes.
-
-Includes can also be used in the 'handlers' section, for instance, if you
-want to define how to restart apache, you only have to do that once for all
-of your playbooks.  You might make a handlers.yml that looks like::
-
-   ---
-   # this might be in a file like handlers/handlers.yml
-   - name: restart apache
-     action: service name=apache state=restarted
-
-And in your main playbook file, just include it like so, at the bottom
-of a play::
-
-   handlers:
-     - include: handlers/handlers.yml
-
-You can mix in includes along with your regular non-included tasks and handlers.
-
-Includes can also be used to import one playbook file into another. This allows
-you to define a top-level playbook that is composed of other playbooks.
-
-For example::
-
-    - name: this is a play at the top level of a file
-      hosts: all
-      user: root
-      tasks:
-      - name: say hi
-        tags: foo
-        action: shell echo "hi..."
-
-    - include: load_balancers.yml
-    - include: webservers.yml
-    - include: dbservers.yml
-
-Note that you cannot do variable substitution when including one playbook
-inside another.
-
-.. note::
-
-   You can not conditionally path the location to an include file,
-   like you can with 'vars_files'.  If you find yourself needing to do
-   this, consider how you can restructure your playbook to be more
-   class/role oriented.  This is to say you cannot use a 'fact' to
-   decide what include file to use.  All hosts contained within the
-   play are going to get the same tasks.  ('only_if' provides some
-   ability for hosts to conditionally skip tasks).
+.. _executing_a_playbook:
 
 Executing A Playbook
 ````````````````````
@@ -425,20 +338,38 @@ Let's run a playbook using a parallelism level of 10::
 
     ansible-playbook playbook.yml -f 10
 
+.. _tips_and_tricks:
+
+
+Ansible-Pull
+````````````
+
+Should you want to invert the architecture of Ansible, so that nodes check in to a central location, instead
+of pushing configuration out to them, you can.
+
+Ansible-pull is a small script that will checkout a repo of configuration instructions from git, and then
+run ansible-playbook against that content.
+
+Assuming you load balance your checkout location, ansible-pull scales essentially infinitely.
+
+Run 'ansible-pull --help' for details.
+
+There's also a `clever playbook <https://github.com/ansible/ansible-examples/blob/master/language_features/ansible_pull.yml>`_ available to using ansible in push mode to configure ansible-pull via a crontab!
+
 Tips and Tricks
 ```````````````
 
-Look at the bottom of the playbook execution for a summary of the nodes that were executed
+Look at the bottom of the playbook execution for a summary of the nodes that were targeted
 and how they performed.   General failures and fatal "unreachable" communication attempts are
 kept separate in the counts.
 
 If you ever want to see detailed output from successful modules as well as unsuccessful ones,
 use the '--verbose' flag.  This is available in Ansible 0.5 and later.
 
-Also, in version 0.5 and later, Ansible playbook output is vastly upgraded if the cowsay
+Ansible playbook output is vastly upgraded if the cowsay
 package is installed.  Try it!
 
-In version 0.7 and later, to see what hosts would be affected by a playbook before you run it, you
+To see what hosts would be affected by a playbook before you run it, you
 can do this::
 
     ansible-playbook playbook.yml --list-hosts.
@@ -447,20 +378,18 @@ can do this::
 
    :doc:`YAMLSyntax`
        Learn about YAML syntax
-   :doc:`playbooks`
-       Review the basic Playbook language features
-   :doc:`playbooks2`
-       Learn about Advanced Playbook Features
-   :doc:`bestpractices`
+   :doc:`playbooks_best_practices`
        Various tips about managing playbooks in the real world
+   :doc:`index`
+       Hop back to the documentation index for a lot of special topics about playbooks
    :doc:`modules`
        Learn about available modules
-   :doc:`moduledev`
+   :doc:`developing_modules`
        Learn how to extend Ansible by writing your own modules
-   :doc:`patterns`
+   :doc:`intro_patterns`
        Learn about how to select hosts
-   `Github examples directory <https://github.com/ansible/ansible/tree/devel/examples/playbooks>`_
-       Complete playbook files from the github project source
+   `Github examples directory <https://github.com/ansible/ansible-examples>`_
+       Complete end-to-end playbook examples
    `Mailing List <http://groups.google.com/group/ansible-project>`_
        Questions? Help? Ideas?  Stop by the list on Google Groups
 

@@ -24,6 +24,7 @@ from ansible.inventory.host import Host
 from ansible.inventory.group import Group
 from ansible import utils
 from ansible import errors
+import sys
 
 class InventoryScript(object):
     ''' Host inventory parser for ansible using external inventory scripts. '''
@@ -41,9 +42,11 @@ class InventoryScript(object):
             raise errors.AnsibleError("problem running %s (%s)" % (' '.join(cmd), e))
         (stdout, stderr) = sp.communicate()
         self.data = stdout
-        self.groups = self._parse()
+        # see comment about _meta below
+        self.host_vars_from_top = None
+        self.groups = self._parse(stderr)
 
-    def _parse(self):
+    def _parse(self, err):
 
         all_hosts = {}
         self.raw  = utils.parse_json(self.data)
@@ -51,16 +54,34 @@ class InventoryScript(object):
         groups    = dict(all=all)
         group     = None
 
+
         if 'failed' in self.raw:
-            raise errors.AnsibleError("failed to parse executable inventory script results")
+            sys.stderr.write(err + "\n")
+            raise errors.AnsibleError("failed to parse executable inventory script results: %s" % self.raw)
 
         for (group_name, data) in self.raw.items():
+ 
+            # in Ansible 1.3 and later, a "_meta" subelement may contain
+            # a variable "hostvars" which contains a hash for each host
+            # if this "hostvars" exists at all then do not call --host for each
+            # host.  This is for efficiency and scripts should still return data
+            # if called with --host for backwards compat with 1.2 and earlier.
 
-            group = groups[group_name] = Group(group_name)
+            if group_name == '_meta':
+                if 'hostvars' in data:
+                    self.host_vars_from_top = data['hostvars']
+                    continue
+
+            if group_name != all.name:
+                group = groups[group_name] = Group(group_name)
+            else:
+                group = all
             host = None
 
             if not isinstance(data, dict):
                 data = {'hosts': data}
+            elif not any(k in data for k in ('hosts','vars')):
+                data = {'hosts': [group_name], 'vars': data}
 
             if 'hosts' in data:
 
@@ -72,11 +93,17 @@ class InventoryScript(object):
 
             if 'vars' in data:
                 for k, v in data['vars'].iteritems():
-                    group.set_variable(k, v)
-            all.add_child_group(group)
+                    if group.name == all.name:
+                        all.set_variable(k, v)
+                    else:
+                        group.set_variable(k, v)
+            if group.name != all.name:
+                all.add_child_group(group)
 
         # Separate loop to ensure all groups are defined
         for (group_name, data) in self.raw.items():
+            if group_name == '_meta':
+                continue
             if isinstance(data, dict) and 'children' in data:
                 for child_name in data['children']:
                     if child_name in groups:
@@ -85,6 +112,11 @@ class InventoryScript(object):
 
     def get_host_variables(self, host):
         """ Runs <script> --host <hostname> to determine additional host variables """
+        if self.host_vars_from_top is not None:
+            got = self.host_vars_from_top.get(host.name, {})
+            return got
+
+
         cmd = [self.filename, "--host", host.name]
         try:
             sp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

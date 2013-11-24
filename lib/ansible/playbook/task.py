@@ -17,36 +17,54 @@
 
 from ansible import errors
 from ansible import utils
-
+import os
+import ansible.utils.template as template
+import sys
 
 class Task(object):
 
     __slots__ = [
-        'name', 'action', 'only_if', 'when', 'async_seconds', 'async_poll_interval',
-        'notify', 'module_name', 'module_args', 'module_vars',
-        'play', 'notified_by', 'tags', 'register',
+        'name', 'meta', 'action', 'only_if', 'when', 'async_seconds', 'async_poll_interval',
+        'notify', 'module_name', 'module_args', 'module_vars', 'default_vars',
+        'play', 'notified_by', 'tags', 'register', 'role_name',
         'delegate_to', 'first_available_file', 'ignore_errors',
-        'local_action', 'transport', 'sudo', 'sudo_user', 'sudo_pass',
+        'local_action', 'transport', 'sudo', 'remote_user', 'sudo_user', 'sudo_pass',
         'items_lookup_plugin', 'items_lookup_terms', 'environment', 'args',
-        'any_errors_fatal'
+        'any_errors_fatal', 'changed_when', 'failed_when', 'always_run', 'delay', 'retries', 'until'
     ]
 
     # to prevent typos and such
     VALID_KEYS = [
-         'name', 'action', 'only_if', 'async', 'poll', 'notify',
+         'name', 'meta', 'action', 'only_if', 'async', 'poll', 'notify',
          'first_available_file', 'include', 'tags', 'register', 'ignore_errors',
-         'delegate_to', 'local_action', 'transport', 'sudo', 'sudo_user',
+         'delegate_to', 'local_action', 'transport', 'remote_user', 'sudo', 'sudo_user',
          'sudo_pass', 'when', 'connection', 'environment', 'args',
-         'any_errors_fatal'
+         'any_errors_fatal', 'changed_when', 'failed_when', 'always_run', 'delay', 'retries', 'until'
     ]
 
-    def __init__(self, play, ds, module_vars=None, additional_conditions=None):
+    def __init__(self, play, ds, module_vars=None, default_vars=None, additional_conditions=None, role_name=None):
         ''' constructor loads from a task or handler datastructure '''
+
+        # meta directives are used to tell things like ansible/playbook to run
+        # operations like handler execution.  Meta tasks are not executed
+        # normally.
+        if 'meta' in ds:
+            self.meta = ds['meta']
+            self.tags = []
+            return
+        else:
+            self.meta = None
+
+
+        library = os.path.join(play.basedir, 'library')
+        if os.path.exists(library):
+            utils.plugins.module_finder.add_directory(library)
 
         for x in ds.keys():
 
             # code to allow for saying "modulename: args" versus "action: modulename args"
             if x in utils.plugins.module_finder:
+
                 if 'action' in ds:
                     raise errors.AnsibleError("multiple actions specified in task %s" % (ds.get('name', ds['action'])))
                 if isinstance(ds[x], dict):
@@ -63,6 +81,10 @@ class Task(object):
 
             # code to allow "with_glob" and to reference a lookup plugin named glob
             elif x.startswith("with_"):
+
+                if isinstance(ds[x], basestring) and ds[x].lstrip().startswith("{{"):
+                    utils.warning("It is unneccessary to use '{{' in loops, leave variables in loop expressions bare.")
+
                 plugin_name = x.replace("with_","")
                 if plugin_name in utils.plugins.lookup_loader:
                     ds['items_lookup_plugin'] = plugin_name
@@ -71,9 +93,13 @@ class Task(object):
                 else:
                     raise errors.AnsibleError("cannot find lookup plugin named %s for usage in with_%s" % (plugin_name, plugin_name))
 
-            elif x == 'when':
-                ds['when'] = "jinja2_compare %s" % (ds[x])
+            elif x in [ 'changed_when', 'failed_when', 'when']:
+                if isinstance(ds[x], basestring) and ds[x].lstrip().startswith("{{"):
+                    utils.warning("It is unneccessary to use '{{' in conditionals, leave variables in loop expressions bare.")
+                ds[x] = "jinja2_compare %s" % (ds[x])
             elif x.startswith("when_"):
+                utils.deprecated("The 'when_' conditional is a deprecated syntax as of 1.2. Switch to using the regular unified 'when' statements as described in ansibleworks.com/docs/.","1.5")
+
                 if 'when' in ds:
                     raise errors.AnsibleError("multiple when_* statements specified in task %s" % (ds.get('name', ds['action'])))
                 when_name = x.replace("when_","")
@@ -83,8 +109,9 @@ class Task(object):
             elif not x in Task.VALID_KEYS:
                 raise errors.AnsibleError("%s is not a legal parameter in an Ansible task or handler" % x)
 
-        self.module_vars = module_vars
-        self.play        = play
+        self.module_vars  = module_vars
+        self.default_vars = default_vars
+        self.play         = play
 
         # load various attributes
         self.name         = ds.get('name', None)
@@ -92,13 +119,32 @@ class Task(object):
         self.register     = ds.get('register', None)
         self.sudo         = utils.boolean(ds.get('sudo', play.sudo))
         self.environment  = ds.get('environment', {})
+        self.role_name    = role_name
+        
+        #Code to allow do until feature in a Task 
+        if 'until' in ds:
+            if not ds.get('register'):
+                raise errors.AnsibleError("register keyword is mandatory when using do until feature")
+            self.module_vars['delay']     = ds.get('delay', 5)
+            self.module_vars['retries']   = ds.get('retries', 3)
+            self.module_vars['register']  = ds.get('register', None)
+            self.until                    = "jinja2_compare %s" % (ds.get('until'))
+            self.module_vars['until']     = utils.compile_when_to_only_if(self.until)
 
         # rather than simple key=value args on the options line, these represent structured data and the values
         # can be hashes and lists, not just scalars
         self.args         = ds.get('args', {})
 
+        # get remote_user for task, then play, then playbook
+        if ds.get('remote_user') is not None:
+            self.remote_user      = ds.get('remote_user')
+        elif ds.get('remote_user', play.remote_user) is not None:
+            self.remote_user      = ds.get('remote_user', play.remote_user)
+        else:
+            self.remote_user      = ds.get('remote_user', play.playbook.remote_user)
+
         if self.sudo:
-            self.sudo_user    = utils.template(play.basedir, ds.get('sudo_user', play.sudo_user), play.vars)
+            self.sudo_user    = ds.get('sudo_user', play.sudo_user)
             self.sudo_pass    = ds.get('sudo_pass', play.playbook.sudo_pass)
         else:
             self.sudo_user    = None
@@ -143,7 +189,20 @@ class Task(object):
 
         # load various attributes
         self.only_if = ds.get('only_if', 'True')
+
+        if self.only_if != 'True':
+            utils.deprecated("only_if is a very old feature and has been obsolete since 0.9, please switch to the 'when' conditional as described at http://ansibleworks.com/docs","1.5")
+
         self.when    = ds.get('when', None)
+        self.changed_when = ds.get('changed_when', None)
+
+        if self.changed_when is not None:
+            self.changed_when = utils.compile_when_to_only_if(self.changed_when)
+
+        self.failed_when = ds.get('failed_when', None)
+
+        if self.failed_when is not None:
+            self.failed_when = utils.compile_when_to_only_if(self.failed_when)
 
         self.async_seconds = int(ds.get('async', 0))  # not async by default
         self.async_poll_interval = int(ds.get('poll', 10))  # default poll = 10 seconds
@@ -156,6 +215,8 @@ class Task(object):
 
         self.ignore_errors = ds.get('ignore_errors', False)
         self.any_errors_fatal = ds.get('any_errors_fatal', play.any_errors_fatal)
+
+        self.always_run = ds.get('always_run', False)
 
         # action should be a string
         if not isinstance(self.action, basestring):
@@ -175,7 +236,9 @@ class Task(object):
             self.module_args = tokens[1]
 
         import_tags = self.module_vars.get('tags',[])
-        if type(import_tags) in [str,unicode]:
+        if type(import_tags) in [int,float]:
+            import_tags = str(import_tags)
+        elif type(import_tags) in [str,unicode]:
             # allow the user to list comma delimited tags
             import_tags = import_tags.split(",")
 
@@ -195,14 +258,20 @@ class Task(object):
         # allow runner to see delegate_to option
         self.module_vars['delegate_to'] = self.delegate_to
 
-        # make ignore_errors accessable to Runner code
+        # make some task attributes accessible to Runner code
         self.module_vars['ignore_errors'] = self.ignore_errors
+        self.module_vars['register'] = self.register
+        self.module_vars['changed_when'] = self.changed_when
+        self.module_vars['failed_when'] = self.failed_when
+        self.module_vars['always_run'] = self.always_run
 
         # tags allow certain parts of a playbook to be run without running the whole playbook
         apply_tags = ds.get('tags', None)
         if apply_tags is not None:
             if type(apply_tags) in [ str, unicode ]:
                 self.tags.append(apply_tags)
+            elif type(apply_tags) in [ int, float ]:
+                self.tags.append(str(apply_tags))
             elif type(apply_tags) == list:
                 self.tags.extend(apply_tags)
         self.tags.extend(import_tags)
@@ -213,5 +282,6 @@ class Task(object):
             self.only_if = utils.compile_when_to_only_if(self.when)
 
         if additional_conditions:
-            self.only_if = '(' + self.only_if + ') and (' + ' ) and ('.join(additional_conditions) + ')'
-
+            new_conditions = additional_conditions
+            new_conditions.append(self.only_if)
+            self.only_if = new_conditions

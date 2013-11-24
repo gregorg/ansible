@@ -50,7 +50,7 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General substitutions.
-project = 'Ansible Documentation'
+project = 'Ansible 1.2 Documentation'
 copyright = "2013 AnsibleWorks"
 
 # The default replacements for |version| and |release|, also used in various
@@ -101,7 +101,7 @@ pygments_style = 'sphinx'
 # -----------------------
 
 html_theme_path = ['_themes']
-html_theme = 'bootstrap'
+html_theme = 'aworks'
 html_short_title = 'Ansible Documentation'
 
 # The style sheet to use for HTML and HTML Help pages. A file of that name
@@ -111,7 +111,7 @@ html_style = 'default.css'
 
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
-html_title = 'Ansible Documentation'
+html_title = 'Ansible 1.2 Documentation'
 
 # A shorter title for the navigation bar.  Default is the same as html_title.
 #html_short_title = None
@@ -123,7 +123,7 @@ html_title = 'Ansible Documentation'
 # The name of an image file (within the static path) to use as favicon of the
 # docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
 # pixels large.
-html_favicon = 'favicon.ico'
+#html_favicon = 'favicon.ico'
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -182,7 +182,7 @@ htmlhelp_basename = 'Poseidodoc'
 # (source start file, target name, title, author, document class
 # [howto/manual]).
 latex_documents = [
-  ('index', 'ansible.tex', 'Ansible Documentation',
+  ('index', 'ansible.tex', 'Ansible 1.2 Documentation',
    AUTHOR, 'manual'),
 ]
 
