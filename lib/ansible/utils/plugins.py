@@ -16,10 +16,11 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import os.path
 import sys
 import glob
 import imp
-import ansible.constants as C
+from ansible import constants as C
 from ansible import errors
 
 MODULE_CACHE = {}
@@ -28,6 +29,8 @@ PLUGIN_PATH_CACHE = {}
 _basedirs = []
 
 def push_basedir(basedir):
+    # avoid pushing the same absolute dir more than once
+    basedir = os.path.abspath(basedir)
     if basedir not in _basedirs:
         _basedirs.insert(0, basedir)
 
@@ -96,7 +99,7 @@ class PluginLoader(object):
         ret = []
         ret += self._extra_dirs
         for basedir in _basedirs:
-            fullpath = os.path.join(basedir, self.subdir)
+            fullpath = os.path.abspath(os.path.join(basedir, self.subdir))
             if os.path.isdir(fullpath):
                 files = glob.glob("%s/*" % fullpath)
                 for file in files:
@@ -108,11 +111,13 @@ class PluginLoader(object):
         # look in any configured plugin paths, allow one level deep for subcategories 
         configured_paths = self.config.split(os.pathsep)
         for path in configured_paths:
+            path = os.path.abspath(os.path.expanduser(path))
             contents = glob.glob("%s/*" % path)
             for c in contents:
-                if os.path.isdir(c):
+                if os.path.isdir(c) and c not in ret:
                     ret.append(c)       
-            ret.append(path)
+            if path not in ret:
+                ret.append(path)
 
         # look for any plugins installed in the package subtree
         ret.extend(self._get_package_paths())
@@ -126,26 +131,27 @@ class PluginLoader(object):
         ''' Adds an additional directory to the search path '''
 
         self._paths = None
+        directory = os.path.abspath(directory)
 
         if directory is not None:
             if with_subdir:
                 directory = os.path.join(directory, self.subdir)
-            self._extra_dirs.append(directory)
+            if directory not in self._extra_dirs:
+                self._extra_dirs.append(directory)
 
     def find_plugin(self, name):
         ''' Find a plugin named name '''
 
-        if 'name' in self._plugin_path_cache:
+        if name in self._plugin_path_cache:
             return self._plugin_path_cache[name]
 
         suffix = ".py"
         if not self.class_name:
             suffix = ""
-        paths = self._get_paths()
 
         for i in self._get_paths():
             path = os.path.join(i, "%s%s" % (name, suffix))
-            if os.path.exists(path):
+            if os.path.isfile(path):
                 self._plugin_path_cache[name] = path
                 return path
 
@@ -174,7 +180,9 @@ class PluginLoader(object):
         ''' instantiates all plugins with the same arguments '''       
 
         for i in self._get_paths():
-            for path in glob.glob(os.path.join(i, "*.py")):
+            matches = glob.glob(os.path.join(i, "*.py"))
+            matches.sort()
+            for path in matches:
                 name, ext = os.path.splitext(os.path.basename(path))
                 if name.startswith("_"):
                     continue

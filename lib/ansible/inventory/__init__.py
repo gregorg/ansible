@@ -20,8 +20,8 @@
 import fnmatch
 import os
 import re
-
 import subprocess
+
 import ansible.constants as C
 from ansible.inventory.ini import InventoryParser
 from ansible.inventory.script import InventoryScript
@@ -38,7 +38,7 @@ class Inventory(object):
 
     __slots__ = [ 'host_list', 'groups', '_restriction', '_also_restriction', '_subset', 
                   'parser', '_vars_per_host', '_vars_per_group', '_hosts_cache', '_groups_list',
-                  '_vars_plugins', '_playbook_basedir']
+                  '_pattern_cache', '_vars_plugins', '_playbook_basedir']
 
     def __init__(self, host_list=C.DEFAULT_HOST_LIST):
 
@@ -53,6 +53,7 @@ class Inventory(object):
         self._vars_per_group = {}
         self._hosts_cache    = {}
         self._groups_list    = {} 
+        self._pattern_cache  = {}
 
         # to be set by calling set_playbook_basedir by ansible-playbook
         self._playbook_basedir = None
@@ -70,16 +71,27 @@ class Inventory(object):
                 host_list = host_list.split(",")
                 host_list = [ h for h in host_list if h and h.strip() ]
 
-        if isinstance(host_list, list):
+        if host_list is None:
+            self.parser = None
+        elif isinstance(host_list, list):
             self.parser = None
             all = Group('all')
             self.groups = [ all ]
+            ipv6_re = re.compile('\[([a-f:A-F0-9]*[%[0-z]+]?)\](?::(\d+))?')
             for x in host_list:
-                if ":" in x:
-                    tokens = x.split(":", 1)
-                    all.add_host(Host(tokens[0], tokens[1]))
+                m = ipv6_re.match(x)
+                if m:
+                    all.add_host(Host(m.groups()[0], m.groups()[1]))
                 else:
-                    all.add_host(Host(x))
+                    if ":" in x:
+                        tokens = x.rsplit(":", 1)
+                        # if there is ':' in the address, then this is a ipv6
+                        if ':' in tokens[0]:
+                            all.add_host(Host(x))
+                        else:
+                            all.add_host(Host(tokens[0], tokens[1]))
+                    else:
+                        all.add_host(Host(x))
         elif os.path.exists(host_list):
             if os.path.isdir(host_list):
                 # Ensure basedir is inside the directory
@@ -121,7 +133,11 @@ class Inventory(object):
         # exclude hosts not in a subset, if defined
         if self._subset:
             subset = self._get_hosts(self._subset)
-            hosts.intersection_update(subset)
+            new_hosts = []
+            for h in hosts:
+                if h in subset and h not in new_hosts:
+                    new_hosts.append(h)
+            hosts = new_hosts
 
         # exclude hosts mentioned in any restriction (ex: failed hosts)
         if self._restriction is not None:
@@ -129,7 +145,7 @@ class Inventory(object):
         if self._also_restriction is not None:
             hosts = [ h for h in hosts if h.name in self._also_restriction ]
 
-        return sorted(hosts, key=lambda x: x.name)
+        return hosts
 
     def _get_hosts(self, patterns):
         """
@@ -137,17 +153,40 @@ class Inventory(object):
         matches as well as intersection matches.
         """
 
-        hosts = set()
+        # Host specifiers should be sorted to ensure consistent behavior
+        pattern_regular = []
+        pattern_intersection = []
+        pattern_exclude = []
         for p in patterns:
             if p.startswith("!"):
-                # Discard excluded hosts
-                hosts.difference_update(self.__get_hosts(p))
+                pattern_exclude.append(p)
             elif p.startswith("&"):
-                # Only leave the intersected hosts
-                hosts.intersection_update(self.__get_hosts(p))
+                pattern_intersection.append(p)
             else:
-                # Get all hosts from both patterns
-                hosts.update(self.__get_hosts(p))
+                pattern_regular.append(p)
+
+        # if no regular pattern was given, hence only exclude and/or intersection
+        # make that magically work
+        if pattern_regular == []:
+            pattern_regular = ['all']
+
+        # when applying the host selectors, run those without the "&" or "!"
+        # first, then the &s, then the !s.
+        patterns = pattern_regular + pattern_intersection + pattern_exclude
+
+        hosts = []
+
+        for p in patterns:
+            that = self.__get_hosts(p)
+            if p.startswith("!"):
+                hosts = [ h for h in hosts if h not in that ]
+            elif p.startswith("&"):
+                hosts = [ h for h in hosts if h in that ]
+            else:
+                for h in that:
+                    if h not in hosts:
+                        hosts.append(h)
+
         return hosts
 
     def __get_hosts(self, pattern):
@@ -156,11 +195,14 @@ class Inventory(object):
         take into account negative matches.
         """
 
+        if pattern in self._pattern_cache:
+            return self._pattern_cache[pattern]
+
         (name, enumeration_details) = self._enumeration_info(pattern)
         hpat = self._hosts_in_unenumerated_pattern(name)
-        hpat = sorted(hpat, key=lambda x: x.name)
-
-        return set(self._apply_ranges(pattern, hpat))
+        result = self._apply_ranges(pattern, hpat)
+        self._pattern_cache[pattern] = result
+        return result
 
     def _enumeration_info(self, pattern):
         """
@@ -173,8 +215,17 @@ class Inventory(object):
             return (pattern, None)
         (first, rest) = pattern.split("[")
         rest = rest.replace("]","")
+        try:
+            # support selectors like webservers[0]
+            x = int(rest)
+            return (first, (x,x)) 
+        except:
+            pass
         if "-" in rest:
             (left, right) = rest.split("-",1)
+            return (first, (left, right))
+        elif ":" in rest:
+            (left, right) = rest.split(":",1)
             return (first, (left, right))
         else:
             return (first, (rest, rest))
@@ -190,30 +241,37 @@ class Inventory(object):
             return hosts
 
         (left, right) = limits
-        enumerated = enumerate(hosts)
+
         if left == '':
             left = 0
         if right == '':
             right = 0
         left=int(left)
         right=int(right)
-        enumerated = [ h for (i,h) in enumerated if i>=left and i<=right ]
-        return enumerated
+        if left != right:
+            return hosts[left:right]
+        else:
+            return [ hosts[left] ]
 
-    # TODO: cache this logic so if called a second time the result is not recalculated
     def _hosts_in_unenumerated_pattern(self, pattern):
         """ Get all host names matching the pattern """
 
-        hosts = {}
+        hosts = []
         # ignore any negative checks here, this is handled elsewhere
         pattern = pattern.replace("!","").replace("&", "")
 
+        results = []
         groups = self.get_groups()
         for group in groups:
             for host in group.get_hosts():
                 if pattern == 'all' or self._match(group.name, pattern) or self._match(host.name, pattern):
-                    hosts[host.name] = host
-        return sorted(hosts.values(), key=lambda x: x.name)
+                    if host not in results:
+                        results.append(host)
+        return results
+
+    def clear_pattern_cache(self):
+        ''' called exclusively by the add_host plugin to allow patterns to be recalculated '''
+        self._pattern_cache = {}
 
     def groups_for_host(self, host):
         results = []
@@ -371,10 +429,16 @@ class Inventory(object):
         if not self.is_file():
             return None
         dname = os.path.dirname(self.host_list)
-        if dname is None or dname == '':
+        if dname is None or dname == '' or dname == '.':
             cwd = os.getcwd()
-            return cwd 
-        return dname
+            return os.path.abspath(cwd) 
+        return os.path.abspath(dname)
+
+    def src(self):
+        """ if inventory came from a file, what's the directory and file name? """
+        if not self.is_file():
+            return None
+        return self.host_list
 
     def playbook_basedir(self):
         """ returns the directory of the current playbook """

@@ -63,6 +63,8 @@ def latex_ify(text):
 
 def html_ify(text):
 
+    #print "DEBUG: text=%s" % text
+    
     t = cgi.escape(text)
     t = _ITALIC.sub("<em>" + r"\1" + "</em>", t)
     t = _BOLD.sub("<b>" + r"\1" + "</b>", t)
@@ -142,7 +144,7 @@ def return_data(text, options, outputname, module):
 
 def boilerplate():
     if not os.path.exists(EXAMPLE_YAML):
-        print >>sys.stderr, "Missing example boiler plate: %S" % EXAMPLE_YAML
+        print >>sys.stderr, "Missing example boiler plate: %s" % EXAMPLE_YAML
     print "DOCUMENTATION = '''"
     print file(EXAMPLE_YAML).read()
     print "'''"
@@ -323,6 +325,9 @@ def main():
         modules.sort()
 
         for module in modules:
+
+            print "rendering: %s" % module
+
             fname = module_map[module]
 
             if len(options.module_list):
@@ -357,6 +362,13 @@ def main():
             if not doc is None:
  
                 all_keys = []
+
+                if not 'version_added' in doc:
+                    sys.stderr.write("*** ERROR: missing version_added in: %s ***\n" % module)
+                    sys.exit(1)
+                    if doc['version_added'] == 'historical':
+                       del doc['version_added']
+
                 for (k,v) in doc['options'].iteritems():
                     all_keys.append(k)
                 all_keys = sorted(all_keys)

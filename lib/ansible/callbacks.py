@@ -31,7 +31,7 @@ import logging
 if constants.DEFAULT_LOG_PATH != '':
     path = constants.DEFAULT_LOG_PATH
 
-    if (os.path.exists(path) and not os.access(path, os.W_OK)) or not os.access(os.path.dirname(path), os.W_OK):
+    if (os.path.exists(path) and not os.access(path, os.W_OK)) and not os.access(os.path.dirname(path), os.W_OK):
         sys.stderr.write("log file at %s is not writeable, aborting\n" % path)
         sys.exit(1)
 
@@ -48,12 +48,10 @@ def load_callback_plugins():
     callback_plugins = [x for x in utils.plugins.callback_loader.all()]
 
 def get_cowsay_info():
-    if constants.ANSIBLE_NOCOWS is not None:
+    if constants.ANSIBLE_NOCOWS:
         return (None, None)
     cowsay = None
-    if os.getenv("ANSIBLE_NOCOWS") is not None:
-        cowsay = None
-    elif os.path.exists("/usr/bin/cowsay"):
+    if os.path.exists("/usr/bin/cowsay"):
         cowsay = "/usr/bin/cowsay"
     elif os.path.exists("/usr/games/cowsay"):
         cowsay = "/usr/games/cowsay"
@@ -76,18 +74,39 @@ def get_cowsay_info():
 cowsay, noncow = get_cowsay_info()
 
 def log_lockfile():
-    tempdir = tempfile.gettempdir() 
+    tempdir = tempfile.gettempdir()
     uid = os.getuid()
     path = os.path.join(tempdir, ".ansible-lock.%s" % uid)
     return path
 
 LOG_LOCK = open(log_lockfile(), 'w')
 
-def log_flock():
-    fcntl.flock(LOG_LOCK, fcntl.LOCK_EX)
+def log_flock(runner):
+    if runner is not None:
+        try:
+            fcntl.lockf(runner.output_lockfile, fcntl.LOCK_EX)
+        except OSError:
+            # already got closed?
+            pass
+    else:
+        try:
+            fcntl.lockf(LOG_LOCK, fcntl.LOCK_EX)
+        except OSError:
+            pass
 
-def log_unflock():
-    fcntl.flock(LOG_LOCK, fcntl.LOCK_UN)
+
+def log_unflock(runner):
+    if runner is not None:
+        try:
+            fcntl.lockf(runner.output_lockfile, fcntl.LOCK_UN)
+        except OSError:
+            # already got closed?
+            pass
+    else:
+        try:
+            fcntl.lockf(LOG_LOCK, fcntl.LOCK_UN)
+        except OSError:
+            pass
 
 def set_play(callback, play):
     ''' used to notify callback plugins of context '''
@@ -101,9 +120,9 @@ def set_task(callback, task):
     for callback_plugin in callback_plugins:
         callback_plugin.task = task
 
-def display(msg, color=None, stderr=False, screen_only=False, log_only=False):
+def display(msg, color=None, stderr=False, screen_only=False, log_only=False, runner=None):
     # prevent a very rare case of interlaced multiprocess I/O
-    log_flock()
+    log_flock(runner)
     msg2 = msg
     if color:
         msg2 = stringc(msg, color)
@@ -120,11 +139,15 @@ def display(msg, color=None, stderr=False, screen_only=False, log_only=False):
                 logger.error(msg)
             else:
                 logger.info(msg)
-    log_unflock()
+    log_unflock(runner)
 
 def call_callback_module(method_name, *args, **kwargs):
 
     for callback_plugin in callback_plugins:
+        # a plugin that set self.disabled to True will not be called
+        # see osx_say.py example for such a plugin
+        if getattr(callback_plugin, 'disabled', False):
+            continue
         methods = [
             getattr(callback_plugin, method_name, None),
             getattr(callback_plugin, 'on_any', None)
@@ -138,6 +161,9 @@ def vv(msg, host=None):
 
 def vvv(msg, host=None):
     return verbose(msg, host=host, caplevel=2)
+
+def vvvv(msg, host=None):
+    return verbose(msg, host=host, caplevel=3)
 
 def verbose(msg, host=None, caplevel=2):
     if utils.VERBOSITY > caplevel:
@@ -170,7 +196,7 @@ class AggregateStats(object):
 
         for (host, value) in runner_results.get('contacted', {}).iteritems():
             if not ignore_errors and (('failed' in value and bool(value['failed'])) or
-                ('rc' in value and value['rc'] != 0)):
+                ('failed_when_result' in value and [value['failed_when_result']] or ['rc' in value and value['rc'] != 0])[0]):
                 self._increment('failures', host)
             elif 'skipped' in value and bool(value['skipped']):
                 self._increment('skipped', host)
@@ -319,7 +345,7 @@ class DefaultRunnerCallbacks(object):
         call_callback_module('runner_on_async_failed', host, res, jid)
 
     def on_file_diff(self, host, diff):
-        call_callback_module('runner_on_file_diff', diff)
+        call_callback_module('runner_on_file_diff', host, diff)
 
 ########################################################################
 
@@ -346,7 +372,7 @@ class CliRunnerCallbacks(DefaultRunnerCallbacks):
     def on_unreachable(self, host, res):
         if type(res) == dict:
             res = res.get('msg','')
-        display("%s | FAILED => %s" % (host, res), stderr=True, color='red')
+        display("%s | FAILED => %s" % (host, res), stderr=True, color='red', runner=self.runner)
         if self.options.tree:
             utils.write_tree_file(
                 self.options.tree, host,
@@ -355,15 +381,15 @@ class CliRunnerCallbacks(DefaultRunnerCallbacks):
         super(CliRunnerCallbacks, self).on_unreachable(host, res)
 
     def on_skipped(self, host, item=None):
-        display("%s | skipped" % (host))
+        display("%s | skipped" % (host), runner=self.runner)
         super(CliRunnerCallbacks, self).on_skipped(host, item)
 
     def on_error(self, host, err):
-        display("err: [%s] => %s\n" % (host, err), stderr=True)
+        display("err: [%s] => %s\n" % (host, err), stderr=True, runner=self.runner)
         super(CliRunnerCallbacks, self).on_error(host, err)
 
     def on_no_hosts(self):
-        display("no hosts matched\n", stderr=True)
+        display("no hosts matched\n", stderr=True, runner=self.runner)
         super(CliRunnerCallbacks, self).on_no_hosts()
 
     def on_async_poll(self, host, res, jid, clock):
@@ -371,27 +397,27 @@ class CliRunnerCallbacks(DefaultRunnerCallbacks):
             self._async_notified[jid] = clock + 1
         if self._async_notified[jid] > clock:
             self._async_notified[jid] = clock
-            display("<job %s> polling, %ss remaining" % (jid, clock))
+            display("<job %s> polling, %ss remaining" % (jid, clock), runner=self.runner)
         super(CliRunnerCallbacks, self).on_async_poll(host, res, jid, clock)
 
     def on_async_ok(self, host, res, jid):
-        display("<job %s> finished on %s => %s"%(jid, host, utils.jsonify(res,format=True)))
+        display("<job %s> finished on %s => %s"%(jid, host, utils.jsonify(res,format=True)), runner=self.runner)
         super(CliRunnerCallbacks, self).on_async_ok(host, res, jid)
 
     def on_async_failed(self, host, res, jid):
-        display("<job %s> FAILED on %s => %s"%(jid, host, utils.jsonify(res,format=True)), color='red', stderr=True)
+        display("<job %s> FAILED on %s => %s"%(jid, host, utils.jsonify(res,format=True)), color='red', stderr=True, runner=self.runner)
         super(CliRunnerCallbacks, self).on_async_failed(host,res,jid)
 
     def _on_any(self, host, result):
         result2 = result.copy()
         result2.pop('invocation', None)
         (msg, color) = host_report_msg(host, self.options.module_name, result2, self.options.one_line)
-        display(msg, color=color)
+        display(msg, color=color, runner=self.runner)
         if self.options.tree:
             utils.write_tree_file(self.options.tree, host, utils.jsonify(result2,format=True))
 
     def on_file_diff(self, host, diff):
-        display(utils.get_diff(diff))
+        display(utils.get_diff(diff), runner=self.runner)
         super(CliRunnerCallbacks, self).on_file_diff(host, diff)
 
 ########################################################################
@@ -399,7 +425,11 @@ class CliRunnerCallbacks(DefaultRunnerCallbacks):
 class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
     ''' callbacks used for Runner() from /usr/bin/ansible-playbook '''
 
-    def __init__(self, stats, verbose=utils.VERBOSITY):
+    def __init__(self, stats, verbose=None):
+
+        if verbose is None:
+            verbose = utils.VERBOSITY
+
         self.verbose = verbose
         self.stats = stats
         self._async_notified = {}
@@ -412,10 +442,11 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
             msg = "fatal: [%s] => (item=%s) => %s" % (host, item, results)
         else:
             msg = "fatal: [%s] => %s" % (host, results)
-        display(msg, color='red')
+        display(msg, color='red', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_unreachable(host, results)
 
     def on_failed(self, host, results, ignore_errors=False):
+
 
         results2 = results.copy()
         results2.pop('invocation', None)
@@ -433,26 +464,27 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
             msg = "failed: [%s] => (item=%s) => %s" % (host, item, utils.jsonify(results2))
         else:
             msg = "failed: [%s] => %s" % (host, utils.jsonify(results2))
-        display(msg, color='red')
+        display(msg, color='red', runner=self.runner)
 
         if stderr:
-            display("stderr: %s" % stderr, color='red')
+            display("stderr: %s" % stderr, color='red', runner=self.runner)
         if stdout:
-            display("stdout: %s" % stdout, color='red')
+            display("stdout: %s" % stdout, color='red', runner=self.runner)
         if returned_msg:
-            display("msg: %s" % returned_msg, color='red')
+            display("msg: %s" % returned_msg, color='red', runner=self.runner)
         if not parsed and module_msg:
-            display("invalid output was: %s" % module_msg, color='red')
+            display("invalid output was: %s" % module_msg, color='red', runner=self.runner)
         if ignore_errors:
-            display("...ignoring", color='cyan')
+            display("...ignoring", color='cyan', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_failed(host, results, ignore_errors=ignore_errors)
 
     def on_ok(self, host, host_result):
+
         item = host_result.get('item', None)
 
         host_result2 = host_result.copy()
         host_result2.pop('invocation', None)
-        verbose_always = host_result2.pop('verbose_always', None)
+        verbose_always = host_result2.pop('verbose_always', False)
         changed = host_result.get('changed', False)
         ok_or_changed = 'ok'
         if changed:
@@ -461,7 +493,7 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
         # show verbose output for non-setup module results if --verbose is used
         msg = ''
         if (not self.verbose or host_result2.get("verbose_override",None) is not
-                None) and verbose_always is None:
+                None) and not verbose_always:
             if item:
                 msg = "%s: [%s] => (item=%s)" % (ok_or_changed, host, item)
             else:
@@ -470,16 +502,16 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
         else:
             # verbose ...
             if item:
-                msg = "%s: [%s] => (item=%s) => %s" % (ok_or_changed, host, item, utils.jsonify(host_result2))
+                msg = "%s: [%s] => (item=%s) => %s" % (ok_or_changed, host, item, utils.jsonify(host_result2, format=verbose_always))
             else:
                 if 'ansible_job_id' not in host_result or 'finished' in host_result2:
-                    msg = "%s: [%s] => %s" % (ok_or_changed, host, utils.jsonify(host_result2))
+                    msg = "%s: [%s] => %s" % (ok_or_changed, host, utils.jsonify(host_result2, format=verbose_always))
 
         if msg != '':
             if not changed:
-                display(msg, color='green')
+                display(msg, color='green', runner=self.runner)
             else:
-                display(msg, color='yellow')
+                display(msg, color='yellow', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_ok(host, host_result)
 
     def on_error(self, host, err):
@@ -491,20 +523,21 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
         else:
             msg = "err: [%s] => %s" % (host, err)
 
-        display(msg, color='red', stderr=True)
+        display(msg, color='red', stderr=True, runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_error(host, err)
 
     def on_skipped(self, host, item=None):
-        msg = ''
-        if item:
-            msg = "skipping: [%s] => (item=%s)" % (host, item)
-        else:
-            msg = "skipping: [%s]" % host
-        display(msg, color='cyan')
-        super(PlaybookRunnerCallbacks, self).on_skipped(host, item)
+        if constants.DISPLAY_SKIPPED_HOSTS:
+            msg = ''
+            if item:
+                msg = "skipping: [%s] => (item=%s)" % (host, item)
+            else:
+                msg = "skipping: [%s]" % host
+            display(msg, color='cyan', runner=self.runner)
+            super(PlaybookRunnerCallbacks, self).on_skipped(host, item)
 
     def on_no_hosts(self):
-        display("FATAL: no hosts matched or all hosts have already failed -- aborting\n", color='red')
+        display("FATAL: no hosts matched or all hosts have already failed -- aborting\n", color='red', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_no_hosts()
 
     def on_async_poll(self, host, res, jid, clock):
@@ -513,21 +546,21 @@ class PlaybookRunnerCallbacks(DefaultRunnerCallbacks):
         if self._async_notified[jid] > clock:
             self._async_notified[jid] = clock
             msg = "<job %s> polling, %ss remaining"%(jid, clock)
-            display(msg, color='cyan')
+            display(msg, color='cyan', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_async_poll(host,res,jid,clock)
 
     def on_async_ok(self, host, res, jid):
         msg = "<job %s> finished on %s"%(jid, host)
-        display(msg, color='cyan')
+        display(msg, color='cyan', runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_async_ok(host, res, jid)
 
     def on_async_failed(self, host, res, jid):
         msg = "<job %s> FAILED on %s" % (jid, host)
-        display(msg, color='red', stderr=True)
+        display(msg, color='red', stderr=True, runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_async_failed(host,res,jid)
 
     def on_file_diff(self, host, diff):
-        display(utils.get_diff(diff))
+        display(utils.get_diff(diff), runner=self.runner)
         super(PlaybookRunnerCallbacks, self).on_file_diff(host, diff)
 
 ########################################################################
@@ -557,11 +590,16 @@ class PlaybookCallbacks(object):
         msg = "TASK: [%s]" % name
         if is_conditional:
             msg = "NOTIFIED: [%s]" % name
-        
+
         if hasattr(self, 'start_at'):
             if name == self.start_at or fnmatch.fnmatch(name, self.start_at):
                 # we found out match, we can get rid of this now
                 del self.start_at
+            elif self.task.role_name:
+                # handle tasks prefixed with rolenames
+                actual_name = name.split('|', 1)[1].lstrip()
+                if actual_name == self.start_at or fnmatch.fnmatch(actual_name, self.start_at):
+                    del self.start_at
 
         if hasattr(self, 'start_at'): # we still have start_at so skip the task
             self.skip_task = True

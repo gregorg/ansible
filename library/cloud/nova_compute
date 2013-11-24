@@ -25,6 +25,7 @@ except ImportError:
 DOCUMENTATION = '''
 ---
 module: nova_compute
+version_added: "1.2"
 short_description: Create/Delete VMs from OpenStack
 description:
    - Create or Remove virtual machines from Openstack.
@@ -61,7 +62,7 @@ options:
      default: present
    name:
      description:
-        - Name that has to be given to the image
+        - Name that has to be given to the instance
      required: true
      default: None
    image_id:
@@ -128,14 +129,17 @@ EXAMPLES = '''
 
 def _delete_server(module, nova):
     name = None
+    server_list = None
     try:
-        server = nova.servers.list(True, {'name': module.params['name']}).pop()
-        nova.servers.delete(server)
+        server_list = nova.servers.list(True, {'name': module.params['name']})
+        if server_list:
+            server = [x for x in server_list if x.name == module.params['name']]
+            nova.servers.delete(server.pop())
     except Exception as e:
         module.fail_json( msg = "Error in deleting vm: %s" % e.message)
     if module.params['wait'] == 'no':
         module.exit_json(changed = True, result = "deleted")
-    expire = time.time() + module.params['wait_for']
+    expire = time.time() + int(module.params['wait_for'])
     while time.time() < expire:
         name = nova.servers.list(True, {'name': module.params['name']})
         if not name:
@@ -160,15 +164,15 @@ def _create_server(module, nova):
     except Exception as e:
             module.fail_json( msg = "Error in creating instance: %s " % e.message)
     if module.params['wait'] == 'yes':
-        expire = time.time() + module.params['wait_for']
+        expire = time.time() + int(module.params['wait_for'])
         while time.time() < expire:
             try:
                 server = nova.servers.get(server.id)
             except Exception as e:
                     module.fail_json( msg = "Error in getting info from instance: %s " % e.message)
             if server.status == 'ACTIVE':
-                private = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'fixed']
-                public  = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'floating']
+                private = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'fixed']
+                public  = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'floating']
                 module.exit_json(changed = True, id = server.id, private_ip=''.join(private), public_ip=''.join(public), status = server.status, info = server._info)
             if server.status == 'ERROR':
                 module.fail_json(msg = "Error in creating the server, please check logs")
@@ -187,14 +191,14 @@ def _get_server_state(module, nova):
     try:
         servers = nova.servers.list(True, {'name': module.params['name']})
         if servers:
-            server = servers.pop()
+            server = [x for x in servers if x.name == module.params['name']][0]
     except Exception as e:
         module.fail_json(msg = "Error in getting the server list: %s" % e.message)
     if server and module.params['state'] == 'present':
         if server.status != 'ACTIVE':
             module.fail_json( msg="The VM is available but not Active. state:" + server.status)
-        private = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'fixed']
-        public  = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if x['OS-EXT-IPS:type'] == 'floating']
+        private = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'fixed']
+        public  = [ x['addr'] for x in getattr(server, 'addresses').itervalues().next() if 'OS-EXT-IPS:type' in x and x['OS-EXT-IPS:type'] == 'floating']
         module.exit_json(changed = False, id = server.id, public_ip = ''.join(public), private_ip = ''.join(private), info = server._info)      
     if server and module.params['state'] == 'absent':
         return True
@@ -213,14 +217,14 @@ def main():
         auth_url                        = dict(default='http://127.0.0.1:35357/v2.0/'),
         region_name                     = dict(default=None),
         name                            = dict(required=True),
-        image_id                        = dict(required=True), 
+        image_id                        = dict(default=None), 
         flavor_id                       = dict(default=1),
         key_name                        = dict(default=None),
         security_groups                 = dict(default='default'),
         nics                            = dict(default=None),
         meta                            = dict(default=None),
         wait                            = dict(default='yes', choices=['yes', 'no']),
-        wait_for                        = dict(default=120),
+        wait_for                        = dict(default=180),
         state                           = dict(default='present', choices=['absent', 'present'])
         ),
     )
@@ -234,8 +238,11 @@ def main():
     except Exception as e:
         module.fail_json( msg = "Error in authenticating to nova: %s" % e.message)
     if module.params['state'] == 'present':
-        _get_server_state(module, nova)
-        _create_server(module, nova)
+        if not module.params['image_id']:
+            module.fail_json( msg = "Parameter 'image_id' is required if state == 'present'")
+        else:
+            _get_server_state(module, nova)
+            _create_server(module, nova)
     if module.params['state'] == 'absent':
         _get_server_state(module, nova)
         _delete_server(module, nova)
