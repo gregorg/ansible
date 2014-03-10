@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -23,6 +23,7 @@ from ansible.inventory.group import Group
 from ansible.inventory.expand_hosts import detect_range
 from ansible.inventory.expand_hosts import expand_hostname_range
 from ansible import errors
+from ansible import utils
 import shlex
 import re
 import ast
@@ -65,7 +66,7 @@ class InventoryParser(object):
         active_group_name = 'ungrouped'
 
         for line in self.lines:
-            line = line.split("#")[0].strip()
+            line = utils.before_comment(line).strip()
             if line.startswith("[") and line.endswith("]"):
                 active_group_name = line.replace("[","").replace("]","")
                 if line.find(":vars") != -1 or line.find(":children") != -1:
@@ -89,10 +90,10 @@ class InventoryParser(object):
                 # 0. A hostname that contains a range pesudo-code and a port
                 # 1. A hostname that contains just a port
                 if hostname.count(":") > 1:
-                    # probably an IPv6 addresss, so check for the format
-                    # XXX:XXX::XXX.port, otherwise we'll just assume no
-                    # port is set 
-                    if hostname.find(".") != -1:
+                    # Possible an IPv6 address, or maybe a host line with multiple ranges
+                    # IPv6 with Port  XXX:XXX::XXX.port
+                    # FQDN            foo.example.com
+                    if hostname.count(".") == 1:
                         (hostname, port) = hostname.rsplit(".", 1)
                 elif (hostname.find("[") != -1 and
                     hostname.find("]") != -1 and
@@ -119,15 +120,25 @@ class InventoryParser(object):
                             if t.startswith('#'):
                                 break
                             try:
-                                (k,v) = t.split("=")
+                                (k,v) = t.split("=", 1)
                             except ValueError, e:
                                 raise errors.AnsibleError("Invalid ini entry: %s - %s" % (t, str(e)))
-                            try:
-                                host.set_variable(k,ast.literal_eval(v))
-                            except:
-                                # most likely a string that literal_eval
-                                # doesn't like, so just set it
-                                host.set_variable(k,v)
+
+                            # If there is a hash in the value don't pass it through to ast at ast will split at the hash.
+                            if "#" in v:
+                                host.set_variable(k, v)
+                            else:
+                                try:
+                                    host.set_variable(k,ast.literal_eval(v))
+                                # Using explicit exceptions.
+                                # Likely a string that literal_eval does not like. We wil then just set it.
+                                except ValueError:
+                                    # For some reason this was thought to be malformed.
+                                    host.set_variable(k, v)
+                                except SyntaxError:
+                                    # Is this a hash with an equals at the end?
+                                    host.set_variable(k, v)
+
                     self.groups[active_group_name].add_host(host)
 
     # [southeast:children]
